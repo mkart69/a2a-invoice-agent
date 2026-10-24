@@ -449,7 +449,7 @@ async def send_message(request: Request):
 
             results_data = get_results(message)
             if results_data:
-                task_id = body.get("taskId")
+                task_id = message.get("taskId")
                 task = read_task(task_id, principal) if task_id else None
                 if not task:
                     return error(404, "TASK_NOT_FOUND", "Task not found")
