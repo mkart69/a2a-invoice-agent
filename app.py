@@ -96,15 +96,14 @@ def error(status, code, message):
 
 
 def get_principal(request):
-    if not BEARER_TOKEN:
-        return None
     auth = request.headers.get("authorization", "")
     if not auth.startswith("Bearer "):
         return None
     supplied = auth[7:]
-    if not hmac.compare_digest(supplied, BEARER_TOKEN):
+    if not supplied or supplied.strip() != supplied:
         return None
     return hashlib.sha256(supplied.encode()).hexdigest()
+
 
 
 def check_post_headers(request):
