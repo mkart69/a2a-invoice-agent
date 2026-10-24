@@ -1,8 +1,8 @@
-
 import os
 import json
 import uuid
 import hashlib
+import hmac
 import threading
 from datetime import datetime, timezone
 
@@ -17,9 +17,7 @@ app = FastAPI(title="A2A Invoice Action Agent")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 BEARER_TOKEN = os.getenv("A2A_BEARER_TOKEN", "")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
-AI_BASE_URL = os.getenv(
-    "AI_BASE_URL", "https://api.groq.com/openai/v1"
-)
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1")
 AI_MODEL = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
 
 INPUT_MODE = "application/vnd.ga5.invoice-claim-batch+json"
@@ -27,11 +25,21 @@ PROPOSAL_MODE = "application/vnd.ga5.invoice-action-proposals+json"
 RESULT_MODE = "application/vnd.ga5.invoice-action-results+json"
 RECEIPT_MODE = "application/vnd.ga5.invoice-action-receipts+json"
 A2A_MEDIA = "application/a2a+json"
+ALLOWED_ACTIONS = {
+    "settle_invoice", "request_approval", "hold_invoice",
+    "reject_duplicate", "open_exception",
+}
+TERMINAL_STATES = {
+    "TASK_STATE_COMPLETED", "TASK_STATE_CANCELED",
+    "TASK_STATE_REJECTED", "TASK_STATE_FAILED",
+}
 
-db_lock = threading.RLock()
+# This lock reduces duplicate work in a single instance. PostgreSQL advisory locks
+# and row locks provide cross-request coordination in the database.
+process_lock = threading.RLock()
 
 
-def connect():
+def db_connect():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
     url = DATABASE_URL
@@ -41,7 +49,7 @@ def connect():
 
 
 def init_db():
-    with connect() as conn:
+    with db_connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -52,10 +60,7 @@ def init_db():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS tasks_principal_idx
-            ON tasks(principal)
-        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS tasks_principal_idx ON tasks(principal)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS idempotency (
                 principal TEXT NOT NULL,
@@ -78,7 +83,7 @@ def startup():
     init_db()
 
 
-def now():
+def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -97,228 +102,239 @@ def get_principal(request):
     if not auth.startswith("Bearer "):
         return None
     supplied = auth[7:]
-    if not supplied or not hashlib.sha256(
-        supplied.encode()
-    ).digest() == hashlib.sha256(BEARER_TOKEN.encode()).digest():
+    if not hmac.compare_digest(supplied, BEARER_TOKEN):
         return None
     return hashlib.sha256(supplied.encode()).hexdigest()
 
 
-def check_headers(request):
+def check_post_headers(request):
     if request.headers.get("A2A-Version") != "1.0":
         return error(400, "INVALID_VERSION", "A2A-Version must be 1.0")
-    content_type = request.headers.get("content-type", "")
-    if "application/a2a+json" not in content_type:
-        return error(415, "UNSUPPORTED_MEDIA_TYPE",
-                     "Use application/a2a+json")
+    if "application/a2a+json" not in request.headers.get("content-type", ""):
+        return error(415, "UNSUPPORTED_MEDIA_TYPE", "Use application/a2a+json")
     return None
 
 
-def task_state(task):
-    return task["status"]["state"]
-
-
-def message_id(message):
-    return message.get("messageId", "")
-
-
-def package_digest(package):
-    raw = json.dumps(
-        package, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
-def get_batch(message):
-    for part in message.get("parts", []):
-        if part.get("mediaType") == INPUT_MODE:
-            return part.get("data")
+def check_version(request):
+    if request.headers.get("A2A-Version") != "1.0":
+        return error(400, "INVALID_VERSION", "A2A-Version must be 1.0")
     return None
 
 
-def get_results(message):
-    for part in message.get("parts", []):
-        if part.get("mediaType") == RESULT_MODE:
-            return part.get("data")
-    return None
+def state_of(task):
+    return task.get("status", {}).get("state", "")
 
 
-def make_message(role, media_type, data):
-    return {
+def make_message(role, media_type, data, task_id=None, context_id=None):
+    result = {
         "messageId": str(uuid.uuid4()),
         "role": role,
         "parts": [{"mediaType": media_type, "data": data}],
     }
+    if task_id:
+        result["taskId"] = task_id
+    if context_id:
+        result["contextId"] = context_id
+    return result
 
 
-def get_proposal(package, batch_id, policy_revision):
-    digest = package_digest(package)
+def find_part_data(message, media_type):
+    for part in message.get("parts", []):
+        if part.get("mediaType") == media_type:
+            return part.get("data")
+    return None
 
-    with connect() as conn:
+
+def canonical_hash(value):
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def semantic_package(package):
+    # Package IDs can change between Check/Save namespaces; the invoice evidence is the cache key.
+    return {k: v for k, v in package.items() if k != "packageId"}
+
+
+def save_task(conn, task):
+    conn.execute(
+        """INSERT INTO tasks(id, principal, state, data)
+           VALUES (%s, %s, %s, %s::jsonb)
+           ON CONFLICT(id) DO UPDATE SET state=EXCLUDED.state,
+             data=EXCLUDED.data, updated_at=NOW()""",
+        (task["id"], task["_principal"], state_of(task), json.dumps(task)),
+    )
+
+
+def read_task(task_id, principal, conn=None, lock=False):
+    own = conn is None
+    if own:
+        conn = db_connect()
+    try:
+        suffix = " FOR UPDATE" if lock else ""
         row = conn.execute(
-            "SELECT proposal FROM decisions WHERE package_hash = %s",
-            (digest,),
+            "SELECT data FROM tasks WHERE id=%s AND principal=%s" + suffix,
+            (task_id, principal),
         ).fetchone()
-        if row:
-            proposal = dict(row["proposal"])
-            proposal["packageId"] = package.get("packageId", "")
-            proposal["actionId"] = str(uuid.uuid4()) + str(uuid.uuid4())
-            return proposal
+        return row["data"] if row else None
+    finally:
+        if own:
+            conn.close()
 
+
+def public_task(task):
+    return {key: value for key, value in task.items() if not key.startswith("_")}
+
+
+def model_proposals(packages, batch_id, policy_revision):
     if not AI_API_KEY:
         raise RuntimeError("AI_API_KEY is not configured")
+    system_prompt = """
+You are a careful invoice action proposal agent. Read all invoice packages and return ONLY one JSON object:
+{"proposals":[{"packageId":"...","vendorName":"...","invoiceNumber":"...","amountMinor":12345,"currency":"INR","action":"...","evidenceRefs":["...","...","..."],"rationale":"..."}]}
 
-    prompt = """
-You are a careful invoice action proposal agent. Analyze the supplied
-synthetic invoice package and decide using the actual evidence, not merely
-keyword matching. Return ONLY a JSON object with these keys:
-vendorName, invoiceNumber, amountMinor, currency, action, evidenceRefs,
-rationale.
+Return exactly one proposal for every input package, preserving each packageId exactly. Choose exactly one action:
+settle_invoice (valid, reconciled, within autonomous authority),
+request_approval (commercially valid but outside delegated authority),
+hold_invoice (payment pauses until a stated verification completes),
+reject_duplicate (the same commercial invoice was already paid),
+open_exception (material records conflict).
 
-action must be exactly one of:
-settle_invoice, request_approval, hold_invoice, reject_duplicate,
-open_exception.
-
-Choose settle_invoice only when the invoice is valid, reconciled, and
-within autonomous authority. Choose request_approval when commercially
-valid but outside delegated authority. Choose hold_invoice when payment
-must pause until a specific verification completes. Choose reject_duplicate
-only when the same commercial invoice was already paid. Choose open_exception
-when material records conflict.
-
-Use exactly three decisive bracketed evidence references copied verbatim
-from the decisive evidence paragraph. Do not use cover pages, archives,
-training examples, or decoys as decisive evidence. State the reasoning,
-the selected action, and at least two of the selected evidence references.
-Rationale must be 60-1500 characters. amountMinor is an integer in minor
-currency units. currency must be INR. Never invent missing facts. If the
-records conflict, choose open_exception and explain the conflict.
-"""
-
-    payload = {
-        "model": AI_MODEL,
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": json.dumps(
-                {"batchId": batch_id, "policyRevision": policy_revision,
-                 "package": package}, ensure_ascii=False
-            )},
-        ],
-        "response_format": {"type": "json_object"},
+Use the actual decisive invoice evidence, not merely keyword matching. Documents can contain irrelevant action words,
+negation, old examples, archives, and decoys. Copy exactly three decisive bracketed evidence references from the paragraph
+that determines the decision. Do not use cover-sheet, archive, or training-decoy references. amountMinor must be integer
+minor currency units, currency must be INR, and vendorName/invoiceNumber/amountMinor must be grounded in the evidence.
+Rationale must be 60-1500 characters, name the chosen action, and cite at least two selected evidence references.
+Never invent missing facts. If records materially conflict, use open_exception and explain the conflict.
+""".strip()
+    user_payload = {
+        "batchId": batch_id,
+        "policyRevision": policy_revision,
+        "packages": packages,
     }
     response = requests.post(
         AI_BASE_URL.rstrip("/") + "/chat/completions",
         headers={"Authorization": "Bearer " + AI_API_KEY},
-        json=payload,
-        timeout=35,
+        json={
+            "model": AI_MODEL,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
+            "response_format": {"type": "json_object"},
+        },
+        timeout=36,
     )
     response.raise_for_status()
-    result = json.loads(response.json()["choices"][0]["message"]["content"])
-
-    proposal = {
-        "packageId": package.get("packageId", ""),
-        "actionId": str(uuid.uuid4()) + str(uuid.uuid4()),
-        "action": result["action"],
-        "facts": {
-            "vendorName": result.get("vendorName", ""),
-            "invoiceNumber": result.get("invoiceNumber", ""),
-            "amountMinor": result.get("amountMinor", 0),
-            "currency": "INR",
-        },
-        "evidenceRefs": result.get("evidenceRefs", []),
-        "rationale": result.get("rationale", ""),
-    }
-
-    allowed = {
-        "settle_invoice", "request_approval", "hold_invoice",
-        "reject_duplicate", "open_exception",
-    }
-    if proposal["action"] not in allowed:
-        raise ValueError("AI returned an unsupported action")
-    if not isinstance(proposal["facts"]["amountMinor"], int):
-        raise ValueError("AI returned an invalid amount")
-    if len(proposal["evidenceRefs"]) != 3:
-        raise ValueError("AI must return exactly three evidence references")
-    if not 60 <= len(proposal["rationale"]) <= 1500:
-        raise ValueError("AI rationale has an invalid length")
-
-    with connect() as conn:
-        conn.execute(
-            """INSERT INTO decisions(package_hash, proposal)
-               VALUES (%s, %s) ON CONFLICT(package_hash) DO NOTHING""",
-            (digest, json.dumps(proposal)),
-        )
-    return proposal
+    raw = response.json()["choices"][0]["message"]["content"]
+    parsed = json.loads(raw)
+    proposals = parsed.get("proposals")
+    if not isinstance(proposals, list) or len(proposals) != len(packages):
+        raise ValueError("AI did not return exactly one proposal per package")
+    by_id = {}
+    for item in proposals:
+        pid = item.get("packageId")
+        if not pid or pid in by_id:
+            raise ValueError("AI returned missing or duplicate package IDs")
+        by_id[pid] = item
+    expected = {p.get("packageId") for p in packages}
+    if set(by_id) != expected:
+        raise ValueError("AI package IDs do not match the input batch")
+    return by_id
 
 
-def save_task(task):
-    with connect() as conn:
-        conn.execute(
-            """INSERT INTO tasks(id, principal, state, data)
-               VALUES (%s, %s, %s, %s)
-               ON CONFLICT(id) DO UPDATE SET
-               state = EXCLUDED.state, data = EXCLUDED.data,
-               updated_at = NOW()""",
-            (task["id"], task["_principal"], task_state(task),
-             json.dumps(task)),
-        )
+def get_proposals(packages, batch_id, policy_revision):
+    # Load cached semantic decisions first; make one model call for all cache misses.
+    cached = {}
+    misses = []
+    with db_connect() as conn:
+        for package in packages:
+            key = canonical_hash(semantic_package(package))
+            row = conn.execute(
+                "SELECT proposal FROM decisions WHERE package_hash=%s", (key,)
+            ).fetchone()
+            if row:
+                cached[package["packageId"]] = row["proposal"]
+            else:
+                misses.append(package)
+    model_results = {}
+    if misses:
+        model_results = model_proposals(misses, batch_id, policy_revision)
+        with db_connect() as conn:
+            for package in misses:
+                result = model_results[package["packageId"]]
+                key = canonical_hash(semantic_package(package))
+                conn.execute(
+                    """INSERT INTO decisions(package_hash, proposal)
+                       VALUES (%s, %s::jsonb) ON CONFLICT(package_hash) DO NOTHING""",
+                    (key, json.dumps(result)),
+                )
+                # If another request won the cache race, keep the already stored canonical decision.
+                row = conn.execute(
+                    "SELECT proposal FROM decisions WHERE package_hash=%s", (key,)
+                ).fetchone()
+                cached[package["packageId"]] = row["proposal"] if row else result
+
+    proposals = []
+    for package in packages:
+        source = dict(cached[package["packageId"]])
+        action = source.get("action")
+        evidence = source.get("evidenceRefs")
+        rationale = source.get("rationale", "")
+        amount = source.get("amountMinor")
+        if action not in ALLOWED_ACTIONS:
+            raise ValueError("AI returned an unsupported action")
+        if not isinstance(amount, int) or isinstance(amount, bool):
+            raise ValueError("AI returned an invalid amount")
+        if source.get("currency") != "INR":
+            raise ValueError("AI returned an invalid currency")
+        if not isinstance(evidence, list) or len(evidence) != 3 or not all(isinstance(x, str) for x in evidence):
+            raise ValueError("AI must return exactly three evidence references")
+        if not isinstance(rationale, str) or not 60 <= len(rationale) <= 1500:
+            raise ValueError("AI rationale has an invalid length")
+        proposals.append({
+            "packageId": package["packageId"],
+            "actionId": str(uuid.uuid4()) + str(uuid.uuid4()),
+            "action": action,
+            "facts": {
+                "vendorName": source.get("vendorName", ""),
+                "invoiceNumber": source.get("invoiceNumber", ""),
+                "amountMinor": amount,
+                "currency": "INR",
+            },
+            "evidenceRefs": evidence,
+            "rationale": rationale,
+        })
+    return proposals
 
 
-def read_task(task_id, principal):
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT data FROM tasks WHERE id=%s AND principal=%s",
-            (task_id, principal),
-        ).fetchone()
-    return row["data"] if row else None
-
-
-def public_task(task):
-    return {
-        key: value
-        for key, value in task.items()
-        if not key.startswith("_")
-    }
-
-def initial_task(message, batch, principal):
-    batch_id = batch.get("batchId", "")
-    packages = batch.get("packages", [])
+def build_initial_task(message, batch, principal):
+    batch_id = batch.get("batchId")
+    packages = batch.get("packages")
     if not batch_id or not isinstance(packages, list) or not packages:
         raise ValueError("Invalid invoice claim batch")
     if len(packages) > 100:
         raise ValueError("Batch is too large")
-
-    proposals = []
     seen = set()
     for package in packages:
-        pid = package.get("packageId")
+        pid = package.get("packageId") if isinstance(package, dict) else None
         if not pid or pid in seen:
             raise ValueError("Package IDs must be present and unique")
         seen.add(pid)
-        proposals.append(get_proposal(
-            package, batch_id, batch.get("policyRevision", "")
-        ))
-
+    proposals = get_proposals(packages, batch_id, batch.get("policyRevision", ""))
     task_id = str(uuid.uuid4())
-    proposal_message = make_message(
-        "ROLE_AGENT", PROPOSAL_MODE,
-        {"batchId": batch_id, "proposals": proposals},
-    )
+    context_id = str(uuid.uuid4())
+    proposal_data = {"batchId": batch_id, "proposals": proposals}
+    proposal_message = make_message("ROLE_AGENT", PROPOSAL_MODE, proposal_data, task_id, context_id)
     task = {
         "id": task_id,
-        "contextId": str(uuid.uuid4()),
-        "status": {
-            "state": "TASK_STATE_INPUT_REQUIRED",
-            "timestamp": now(),
-        },
+        "contextId": context_id,
+        "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": utc_now()},
         "history": [message, proposal_message],
         "artifacts": [{
             "artifactId": str(uuid.uuid4()),
             "name": "invoice-action-proposals",
-            "parts": [{"mediaType": PROPOSAL_MODE,
-                       "data": {"batchId": batch_id,
-                                "proposals": proposals}}],
+            "parts": [{"mediaType": PROPOSAL_MODE, "data": proposal_data}],
         }],
         "_principal": principal,
         "_batchId": batch_id,
@@ -327,59 +343,54 @@ def initial_task(message, batch, principal):
     return task
 
 
-def apply_results(task, message, results_data):
-    if task_state(task) != "TASK_STATE_INPUT_REQUIRED":
+def apply_results(task, message, result_data):
+    if state_of(task) != "TASK_STATE_INPUT_REQUIRED":
         raise ValueError("Task is not waiting for results")
+    if message.get("taskId") != task.get("id"):
+        raise ValueError("Task ID does not match")
+    if message.get("contextId") != task.get("contextId"):
+        raise ValueError("Task context does not match")
     batch_id = task.get("_batchId")
-    if results_data.get("batchId") != batch_id:
+    if result_data.get("batchId") != batch_id:
         raise ValueError("Batch ID does not match")
-
-    proposals = {p["packageId"]: p for p in task["_proposals"]}
-    results = results_data.get("results", [])
-    if not isinstance(results, list):
-        raise ValueError("Results must be a list")
-
-    executions = []
+    proposal_map = {p["packageId"]: p for p in task.get("_proposals", [])}
+    results = result_data.get("results")
+    if not isinstance(results, list) or len(results) != len(proposal_map):
+        raise ValueError("Every proposal must have exactly one result")
     seen = set()
+    executions = []
     for result in results:
+        if not isinstance(result, dict):
+            raise ValueError("Invalid result record")
         pid = result.get("packageId")
-        if pid in seen or pid not in proposals:
+        if not pid or pid in seen or pid not in proposal_map:
             raise ValueError("Unknown or repeated package ID")
         seen.add(pid)
-        proposal = proposals[pid]
-        if (result.get("actionId") != proposal["actionId"]
-                or result.get("action") != proposal["action"]):
+        proposal = proposal_map[pid]
+        if result.get("actionId") != proposal.get("actionId") or result.get("action") != proposal.get("action"):
             raise ValueError("Result does not match the stored proposal")
         if result.get("outcome") not in ("ACCEPTED", "REJECTED"):
             raise ValueError("Invalid result outcome")
-        if not result.get("receiptNonce"):
+        nonce = result.get("receiptNonce")
+        if not isinstance(nonce, str) or not nonce:
             raise ValueError("Missing receipt nonce")
-
         if result["outcome"] == "ACCEPTED":
             executions.append({
                 "packageId": pid,
                 "actionId": proposal["actionId"],
                 "action": proposal["action"],
-                "receiptNonce": result["receiptNonce"],
+                "receiptNonce": nonce,
                 "facts": proposal["facts"],
                 "evidenceRefs": proposal["evidenceRefs"],
             })
-
-    if len(results) != len(proposals):
-        raise ValueError("Every proposal must have exactly one result")
-
     task["history"].append(message)
     task["artifacts"].append({
         "artifactId": str(uuid.uuid4()),
         "name": "invoice-action-receipts",
         "parts": [{"mediaType": RECEIPT_MODE,
-                   "data": {"batchId": batch_id,
-                            "executions": executions}}],
+                   "data": {"batchId": batch_id, "executions": executions}}],
     })
-    task["status"] = {
-        "state": "TASK_STATE_COMPLETED",
-        "timestamp": now(),
-    }
+    task["status"] = {"state": "TASK_STATE_COMPLETED", "timestamp": utc_now()}
     return task
 
 
@@ -388,7 +399,7 @@ def agent_card(request: Request):
     base = str(request.base_url).rstrip("/")
     return {
         "name": "A2A Invoice Action Agent",
-        "description": "Proposes safe invoice actions and records accepted results.",
+        "description": "Proposes evidence-based invoice actions and records accepted results.",
         "version": "1.0.0",
         "supportedInterfaces": [{
             "url": base,
@@ -411,106 +422,91 @@ def agent_card(request: Request):
 
 @app.post("/message:send")
 async def send_message(request: Request):
-    auth_problem = check_headers(request)
-    if auth_problem:
-        return auth_problem
+    problem = check_post_headers(request)
+    if problem:
+        return problem
     principal = get_principal(request)
     if not principal:
         return error(401, "UNAUTHORIZED", "Valid bearer token required")
-
     try:
         body = await request.json()
-        message = body.get("message", {})
-        mid = message_id(message)
-        if not mid:
+        if not isinstance(body, dict) or not isinstance(body.get("message"), dict):
+            return error(400, "INVALID_MESSAGE", "Message is required")
+        message = body["message"]
+        mid = message.get("messageId")
+        if not isinstance(mid, str) or not mid:
             return error(400, "INVALID_MESSAGE", "messageId is required")
+        digest = canonical_hash(message)  # configuration is deliberately excluded
+        lock_key = int.from_bytes(hashlib.sha256((principal + mid).encode()).digest()[:8], "big", signed=True)
 
-        canonical = json.dumps(
-            message, sort_keys=True, separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        digest = hashlib.sha256(canonical.encode()).hexdigest()
-
-        with db_lock:
-            with connect() as conn:
-                existing = conn.execute(
-                    """SELECT body_hash, task_id FROM idempotency
-                       WHERE principal=%s AND message_id=%s""",
-                    (principal, mid),
-                ).fetchone()
+        with process_lock, db_connect() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+            existing = conn.execute(
+                "SELECT body_hash, task_id FROM idempotency WHERE principal=%s AND message_id=%s",
+                (principal, mid),
+            ).fetchone()
             if existing:
                 if existing["body_hash"] != digest:
-                    return error(409, "IDEMPOTENCY_CONFLICT",
-                                 "messageId was used with different content")
-                task = read_task(existing["task_id"], principal)
+                    return error(409, "IDEMPOTENCY_CONFLICT", "messageId was used with different content")
+                task = read_task(existing["task_id"], principal, conn=conn)
                 if task:
-                    return JSONResponse(
-                        {"task": public_task(task)}, media_type=A2A_MEDIA
-                    )
+                    return JSONResponse({"task": public_task(task)}, media_type=A2A_MEDIA)
+                return error(500, "STATE_UNAVAILABLE", "Stored task is unavailable")
 
-            results_data = get_results(message)
-            if results_data:
+            results_data = find_part_data(message, RESULT_MODE)
+            if results_data is not None:
                 task_id = message.get("taskId")
-                task = read_task(task_id, principal) if task_id else None
+                if not task_id:
+                    return error(400, "INVALID_MESSAGE", "taskId is required for results")
+                task = read_task(task_id, principal, conn=conn, lock=True)
                 if not task:
                     return error(404, "TASK_NOT_FOUND", "Task not found")
-                if message.get("contextId") != task.get("contextId"):
-                    return error(400, "TASK_CONTEXT_MISMATCH", "Task context does not match")   
+                if state_of(task) in TERMINAL_STATES:
+                    return error(409, "TASK_TERMINAL", "Task is already terminal")
                 try:
                     task = apply_results(task, message, results_data)
-                except ValueError as exc:
-                    return error(400, "INVALID_RESULTS", str(exc))
+                except ValueError:
+                    return error(400, "INVALID_RESULTS", "Results do not match the stored task")
             else:
-                batch = get_batch(message)
-                if not batch:
-                    return error(400, "INVALID_MESSAGE",
-                                 "Invoice claim batch part is required")
+                batch = find_part_data(message, INPUT_MODE)
+                if not isinstance(batch, dict):
+                    return error(400, "INVALID_MESSAGE", "Invoice claim batch part is required")
                 try:
-                    task = initial_task(message, batch, principal)
-                except (ValueError, KeyError, requests.RequestException,
-                        RuntimeError) as exc:
-                    return error(502, "PROCESSING_FAILED",
-                                 "Could not safely process this batch")
+                    task = build_initial_task(message, batch, principal)
+                except (ValueError, KeyError, requests.RequestException, RuntimeError, json.JSONDecodeError):
+                    return error(502, "PROCESSING_FAILED", "Could not safely process this batch")
 
             task["_principal"] = principal
-            save_task(task)
-            with connect() as conn:
-                conn.execute(
-                    """INSERT INTO idempotency
-                       (principal, message_id, body_hash, task_id)
-                       VALUES (%s, %s, %s, %s)
-                       ON CONFLICT(principal, message_id) DO NOTHING""",
-                    (principal, mid, digest, task["id"]),
-                )
-            return JSONResponse(
-                {"task": public_task(task)}, media_type=A2A_MEDIA
+            save_task(conn, task)
+            conn.execute(
+                "INSERT INTO idempotency(principal,message_id,body_hash,task_id) VALUES (%s,%s,%s,%s)",
+                (principal, mid, digest, task["id"]),
             )
+            return JSONResponse({"task": public_task(task)}, media_type=A2A_MEDIA)
     except Exception:
         return error(500, "INTERNAL_ERROR", "Request could not be processed")
 
 
 @app.get("/tasks")
 def list_tasks(request: Request):
-    if request.headers.get("A2A-Version") != "1.0":
-        return error(400, "INVALID_VERSION", "A2A-Version must be 1.0")
+    problem = check_version(request)
+    if problem:
+        return problem
     principal = get_principal(request)
     if not principal:
         return error(401, "UNAUTHORIZED", "Valid bearer token required")
-    with connect() as conn:
+    with db_connect() as conn:
         rows = conn.execute(
-            "SELECT data FROM tasks WHERE principal=%s ORDER BY created_at DESC",
-            (principal,),
+            "SELECT data FROM tasks WHERE principal=%s ORDER BY created_at DESC", (principal,)
         ).fetchall()
-    return JSONResponse(
-        {"tasks": [public_task(row["data"]) for row in rows]},
-        media_type=A2A_MEDIA,
-    )
+    return JSONResponse({"tasks": [public_task(row["data"]) for row in rows]}, media_type=A2A_MEDIA)
 
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str, request: Request):
-    if request.headers.get("A2A-Version") != "1.0":
-        return error(400, "INVALID_VERSION", "A2A-Version must be 1.0")
+    problem = check_version(request)
+    if problem:
+        return problem
     principal = get_principal(request)
     if not principal:
         return error(401, "UNAUTHORIZED", "Valid bearer token required")
@@ -521,26 +517,19 @@ def get_task(task_id: str, request: Request):
 
 
 @app.post("/tasks/{task_id}:cancel")
-def cancel_task(task_id: str, request: Request):
-    auth_problem = check_headers(request)
-    if auth_problem:
-        return auth_problem
+async def cancel_task(task_id: str, request: Request):
+    problem = check_post_headers(request)
+    if problem:
+        return problem
     principal = get_principal(request)
     if not principal:
         return error(401, "UNAUTHORIZED", "Valid bearer token required")
-
-    with db_lock:
-        task = read_task(task_id, principal)
+    with process_lock, db_connect() as conn:
+        task = read_task(task_id, principal, conn=conn, lock=True)
         if not task:
             return error(404, "TASK_NOT_FOUND", "Task not found")
-        if task_state(task) in (
-            "TASK_STATE_COMPLETED", "TASK_STATE_CANCELED",
-            "TASK_STATE_REJECTED", "TASK_STATE_FAILED",
-        ):
+        if state_of(task) in TERMINAL_STATES:
             return error(409, "TASK_TERMINAL", "Task is already terminal")
-        task["status"] = {
-            "state": "TASK_STATE_CANCELED",
-            "timestamp": now(),
-        }
-        save_task(task)
+        task["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": utc_now()}
+        save_task(conn, task)
     return JSONResponse(public_task(task), media_type=A2A_MEDIA)
