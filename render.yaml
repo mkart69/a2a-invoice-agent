@@ -6,3 +6,18 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: a2a-invoice-db
+          property: connectionString
+      - key: A2A_BEARER_TOKEN
+        generateValue: true
+      - key: AI_API_KEY
+        sync: false
+
+databases:
+  - name: a2a-invoice-db
+    databaseName: invoice_agent
+    user: invoice_agent
+    plan: free
