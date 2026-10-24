@@ -160,8 +160,8 @@ def get_proposal(package, batch_id, policy_revision):
             (digest,),
         ).fetchone()
         if row:
-            proposal = row["proposal"]
-            proposal = dict(proposal)
+            proposal = dict(row["proposal"])
+            proposal["packageId"] = package.get("packageId", "")
             proposal["actionId"] = str(uuid.uuid4()) + str(uuid.uuid4())
             return proposal
 
