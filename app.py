@@ -454,6 +454,8 @@ async def send_message(request: Request):
                 task = read_task(task_id, principal) if task_id else None
                 if not task:
                     return error(404, "TASK_NOT_FOUND", "Task not found")
+                if message.get("contextId") != task.get("contextId"):
+                    return error(400, "TASK_CONTEXT_MISMATCH", "Task context does not match")   
                 try:
                     task = apply_results(task, message, results_data)
                 except ValueError as exc:
