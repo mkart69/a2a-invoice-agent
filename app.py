@@ -275,10 +275,11 @@ def read_task(task_id, principal):
 
 
 def public_task(task):
-    result = dict(task)
-    result.pop("_principal", None)
-    return result
-
+    return {
+        key: value
+        for key, value in task.items()
+        if not key.startswith("_")
+    }
 
 def initial_task(message, batch, principal):
     batch_id = batch.get("batchId", "")
