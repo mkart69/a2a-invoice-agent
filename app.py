@@ -261,7 +261,6 @@ def get_proposals(packages, batch_id, policy_revision):
                 cached[package["packageId"]] = row["proposal"]
             else:
                 misses.append(package)
-   
     model_results = {}
     if misses:
         for start in range(0, len(misses), 2):
