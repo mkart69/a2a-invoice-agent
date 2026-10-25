@@ -224,10 +224,12 @@ Never invent missing facts. If records materially conflict, use open_exception a
         },
         timeout=36,
     )
+    
     if not response.ok:
-    print("Groq API error status:", response.status_code)
-    print("Groq API error body:", response.text[:1000])
-    response.raise_for_status()
+        print("Groq API error status:", response.status_code)
+        print("Groq API error body:", response.text[:1000])
+        response.raise_for_status()
+
     raw = response.json()["choices"][0]["message"]["content"]
     parsed = json.loads(raw)
     proposals = parsed.get("proposals")
