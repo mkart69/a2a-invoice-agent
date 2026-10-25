@@ -261,23 +261,34 @@ def get_proposals(packages, batch_id, policy_revision):
                 cached[package["packageId"]] = row["proposal"]
             else:
                 misses.append(package)
-    model_results = {}
-    if misses:
-        model_results = model_proposals(misses, batch_id, policy_revision)
+   
+model_results = {}
+if misses:
+    for start in range(0, len(misses), 2):
+        chunk = misses[start:start + 2]
+        chunk_results = model_proposals(
+            chunk, batch_id, policy_revision
+        )
+        model_results.update(chunk_results)
+
         with db_connect() as conn:
-            for package in misses:
-                result = model_results[package["packageId"]]
+            for package in chunk:
+                result = chunk_results[package["packageId"]]
                 key = canonical_hash(semantic_package(package))
                 conn.execute(
                     """INSERT INTO decisions(package_hash, proposal)
-                       VALUES (%s, %s::jsonb) ON CONFLICT(package_hash) DO NOTHING""",
+                       VALUES (%s, %s::jsonb)
+                       ON CONFLICT(package_hash) DO NOTHING""",
                     (key, json.dumps(result)),
                 )
-                # If another request won the cache race, keep the already stored canonical decision.
+                # If another request won the cache race, keep its decision.
                 row = conn.execute(
-                    "SELECT proposal FROM decisions WHERE package_hash=%s", (key,)
+                    "SELECT proposal FROM decisions WHERE package_hash=%s",
+                    (key,),
                 ).fetchone()
-                cached[package["packageId"]] = row["proposal"] if row else result
+                model_results[package["packageId"]] = (
+                    row["proposal"] if row else result
+                )
 
     proposals = []
     for package in packages:
