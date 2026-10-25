@@ -262,9 +262,9 @@ def get_proposals(packages, batch_id, policy_revision):
             else:
                 misses.append(package)
    
-model_results = {}
-if misses:
-    for start in range(0, len(misses), 2):
+    model_results = {}
+    if misses:
+        for start in range(0, len(misses), 2):
         chunk = misses[start:start + 2]
         chunk_results = model_proposals(
             chunk, batch_id, policy_revision
@@ -289,6 +289,7 @@ if misses:
                 model_results[package["packageId"]] = (
                     row["proposal"] if row else result
                 )
+
 
     proposals = []
     for package in packages:
